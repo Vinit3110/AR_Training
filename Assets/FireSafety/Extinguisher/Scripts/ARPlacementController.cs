@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using TMPro;
 using UnityEngine;
+using UnityEngine.EventSystems;
+using UnityEngine.InputSystem;
 using UnityEngine.UI;
 using UnityEngine.XR.ARFoundation;
 using UnityEngine.XR.ARSubsystems;
@@ -35,6 +37,8 @@ public class ARPlacementController : MonoBehaviour
     [SerializeField] private bool hidePlaneVisualsAfterPlacement = true;
 
     private readonly List<ARRaycastHit> hits = new List<ARRaycastHit>();
+    private readonly List<RaycastResult> uiHits = new List<RaycastResult>();
+    private PointerEventData uiPointer;
     private readonly List<Vector2> boundary = new List<Vector2>();
     private readonly Vector2[] planeCorners = new Vector2[4];
     private readonly Vector3[] localCorners = new Vector3[4];
@@ -121,10 +125,14 @@ public class ARPlacementController : MonoBehaviour
             if (hidePlaneVisualsAfterPlacement) HidePlaneVisuals();
             return;
         }
-        if (!isPlacing && Time.unscaledTime >= errorUntil) UpdatePlacement();
+        if (!isPlacing && Time.unscaledTime >= errorUntil)
+        {
+            UpdatePlacement(arCamera.pixelRect.center);
+            TryPlaceFromScreenTap();
+        }
     }
 
-    private void UpdatePlacement()
+    private void UpdatePlacement(Vector2 screenPosition)
     {
         hasValidPlacement = false;
         candidatePlane = null;
@@ -135,8 +143,7 @@ public class ARPlacementController : MonoBehaviour
             return;
         }
 
-        Vector2 center = arCamera.pixelRect.center;
-        if (!raycastManager.Raycast(center, hits, TrackableType.PlaneWithinPolygon))
+        if (!raycastManager.Raycast(screenPosition, hits, TrackableType.PlaneWithinPolygon))
         {
             SetButton(false, "Aim the centre of the screen at a horizontal surface.");
             return;
@@ -166,11 +173,64 @@ public class ARPlacementController : MonoBehaviour
             foreach (Renderer markerRenderer in markerRenderers)
                 if (markerRenderer != null) markerRenderer.SetPropertyBlock(previewProperties);
             reticle.SetActive(true);
-            SetButton(hasValidPlacement, hasValidPlacement ? "Ready. Press Place Training to place at the marker." : "Scan more floor to fit the configured footprint.");
+            SetButton(hasValidPlacement, hasValidPlacement ? "Ready. Tap the marker to place training." : "Scan more floor to fit the configured footprint.");
             // Do not look through a nearer unsuitable floor/table to place on one behind it.
             return;
         }
         SetButton(false, rejection);
+    }
+
+    private void TryPlaceFromScreenTap()
+    {
+        if (Touchscreen.current != null)
+        {
+            foreach (var touch in Touchscreen.current.touches)
+            {
+                if (!touch.press.wasPressedThisFrame) continue;
+                TryPlaceAt(touch.position.ReadValue());
+                return;
+            }
+        }
+#if UNITY_EDITOR
+        // Let the same flow be exercised with a mouse while testing in the Editor.
+        if (Mouse.current != null && Mouse.current.leftButton.wasPressedThisFrame)
+            TryPlaceAt(Mouse.current.position.ReadValue());
+#endif
+    }
+
+    private void TryPlaceAt(Vector2 screenPosition)
+    {
+        if (IsOverBlockingUI(screenPosition)) return;
+
+        UpdatePlacement(screenPosition);
+        if (!hasValidPlacement)
+        {
+            Debug.Log("[AR Placement] Screen tap did not hit a valid tracked horizontal surface.", this);
+            return;
+        }
+
+        // The candidate pose now matches this tap, so the existing anchor and activation
+        // flow places the configured FireSafetyEnvironment at the touched point.
+        PlaceTraining();
+    }
+
+    private bool IsOverBlockingUI(Vector2 screenPosition)
+    {
+        EventSystem eventSystem = EventSystem.current;
+        if (eventSystem == null) return false;
+
+        if (uiPointer == null) uiPointer = new PointerEventData(eventSystem);
+        uiPointer.position = screenPosition;
+        uiHits.Clear();
+        eventSystem.RaycastAll(uiPointer, uiHits);
+        foreach (RaycastResult hit in uiHits)
+        {
+            // The optional status label should not prevent tapping the visible floor marker.
+            if (statusText != null && (hit.gameObject == statusText.gameObject ||
+                hit.gameObject.transform.IsChildOf(statusText.transform))) continue;
+            return true;
+        }
+        return false;
     }
 
     private static bool UsablePlane(ARPlane plane) => plane != null && plane.isActiveAndEnabled &&
